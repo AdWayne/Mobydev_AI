@@ -1,107 +1,119 @@
 import os
-import sys
 import json
+import csv
+import random
 from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("API"))
-MODEL = os.getenv("MODEL", "gpt-4o-mini")
 
-FUNCTIONS = [{
-    "name": "generate_quiz",
-    "description": "Генерирует школьный квиз по теме",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "topic": {"type": "string"},
-            "grade_level": {"type": "string", "enum": ["K-3","4-6","7-9","10-12"]},
-            "num_questions": {"type": "integer", "minimum":3, "maximum":20},
-            "question_type": {"type": "string", "enum": ["mcq","short","mix"]},
-            "language": {"type": "string", "enum": ["ru","kz"]},
-        },
-        "required": ["topic", "grade_level", "num_questions"],
-        "strict": True
-    }
-}]
+class AIQuizGenerator:
+    def __init__(self, seed=42):
+        self.client = OpenAI(api_key=os.getenv("API"))
+        self.seed = seed
+        random.seed(self.seed)
+        self.questions = []
+        self.score = 0
 
-def generate_quiz(topic: str, grade_level: str, num_questions: int, question_type: str = "mix", language: str = "ru") -> str:
-    system_prompt = "Ты строгий проверяющий и создатель викторин. Созвращай ТОЛЬКО JSON с вопросами викторины."
-    user_prompt = f"""
-topic: {topic}
-grade_level: {grade_level}
-num_questions: {num_questions}
-question_type: {question_type}
-language: {language}
+    def generate_quiz(self, topic, count=5, q_type="mixed"):
+        type_instruction = {
+            "1": "Use only 'multiple' choice questions with 4 options.",
+            "2": "Use only 'open' questions (no options, direct text answer).",
+            "3": "Mix both 'multiple' and 'open' questions."
+        }
+        
+        selected_instruction = type_instruction.get(q_type, type_instruction["3"])
 
-Return JSON with:
-- topic, grade_level
-- items: list of {{
-    id:int, q:str, type:"mcq"|"short",
-    options:[str] (only if mcq), answer:str}}
-- answer_key: list of {{id:int, answer:str}}
-""".strip()
+        prompt = f"""
+        Generate a quiz about '{topic}'. 
+        Count: {count} questions. 
+        Style: {selected_instruction}
+        Format: Return ONLY a JSON object with a key 'quiz' containing a list of objects.
+        Each object:
+        - 'question': text
+        - 'type': 'multiple' or 'open'
+        - 'options': list of 4 strings (null if open)
+        - 'answer': correct string value
+        """
+        
+        response = self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": "You are a professional quiz creator. Output only valid JSON."},
+                      {"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        
+        raw_data = json.loads(response.choices[0].message.content)
+        self.questions = raw_data['quiz']
+        
+        for q in self.questions:
+            if q['type'] == 'multiple' and q['options']:
+                random.shuffle(q['options'])
+        
+        self.save_structure()
 
-    r = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system_prompt},
-                  {"role": "user", "content": user_prompt}],
-        temperature=0.2
-    )
+    def save_structure(self, filename="quiz.json"):
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(self.questions, f, ensure_ascii=False, indent=4)
 
-    text = r.choices[0].message.content.strip()
-    return text
+    def start(self):
+        report_data = []
+        
+        for i, q in enumerate(self.questions):
+            print(f"\nВопрос {i+1}: {q['question']}")
+            
+            user_answer = ""
+            if q['type'] == 'multiple':
+                for idx, opt in enumerate(q['options']):
+                    print(f"{idx + 1}. {opt}")
+                
+                choice = input("Ваш ответ (номер): ")
+                try:
+                    user_answer = q['options'][int(choice) - 1]
+                except:
+                    user_answer = choice
+            else:
+                user_answer = input("Ваш ответ: ")
 
-AVAILABLE = {"generate_quiz": generate_quiz}
-SYSTEM = "Ты - ассистент учителя. Если нужно, вызывай инструмент generate_quiz. Уточняй недостающие параметры."
+            is_correct = user_answer.strip().lower() == q['answer'].strip().lower()
+            
+            if is_correct:
+                print("Верно!")
+                self.score += 1
+            else:
+                print(f"Ошибка. Правильный ответ: {q['answer']}")
+            
+            report_data.append({
+                "Question": q['question'],
+                "Your Answer": user_answer,
+                "Correct Answer": q['answer'],
+                "Result": "Correct" if is_correct else "Wrong"
+            })
 
-def ask(user_text: str) -> str:
-    messages = [{"role": "system", "content": SYSTEM},
-                {"role": "user", "content": user_text}]
+        self.save_report(report_data)
 
-    r1 = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        functions=FUNCTIONS,
-        function_call="auto",
-        temperature=0
-    )
-
-    m1 = r1.choices[0].message
-
-    if not getattr(m1, "function_call", None):
-        return m1.content or ""
-    
-    fn_name = m1.function_call.name
-    raw_args = m1.function_call.arguments or "{}"
-    try:
-        args = json.loads(raw_args)
-    except json.JSONDecodeError:
-        args = {}
-
-    fn = AVAILABLE.get(fn_name)
-    if not fn:
-        return "Извините, этот инструмент не поддерживается."
-    
-    result_json = fn(**args)
-    
-    messages.append({"role": "assistant", "content": None,
-                     "function_call": {"name": fn_name, "arguments": raw_args}})
-    messages.append({"role": "function", "name": fn_name, "content": result_json})
-
-    r2 = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        temperature=0
-    )
-    return r2.choices[0].message.content
+    def save_report(self, data, filename="report.csv"):
+        if not data: return
+        keys = data[0].keys()
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            dict_writer = csv.DictWriter(f, fieldnames=keys)
+            dict_writer.writeheader()
+            dict_writer.writerows(data)
+        
+        print(f"\nИтог: {self.score}/{len(self.questions)}")
+        print(f"Результаты сохранены в quiz.json и report.csv")
 
 if __name__ == "__main__":
-    print("Привет! Я помогу тебе создать викторину. Просто скажи мне тему и другие детали.")
-    try:
-        while True:
-            q = input("> ").strip()
-            if q:
-                print(ask(q))  
-    except KeyboardInterrupt:
-        print("\nПока!")
+    quiz_app = AIQuizGenerator()
+    
+    topic = input("Введите тему викторины: ")
+    count = input("Количество вопросов: ")
+    
+    print("\nВыберите тип вопросов:")
+    print("1 - Только тест (выбор варианта)")
+    print("2 - Только открытые вопросы")
+    print("3 - Смешанные")
+    q_choice = input("Ваш выбор: ")
+    
+    quiz_app.generate_quiz(topic, count=int(count), q_type=q_choice)
+    quiz_app.start()
